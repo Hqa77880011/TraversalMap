@@ -1,0 +1,193 @@
+import numpy as np
+from scipy.optimize import linear_sum_assignment, minimize
+
+
+METHODS = ["traversalmap", "local_only", "no_cyclic_angle", "shuffled_order", "hard_order"]
+
+
+def wrap(value):
+    return np.arctan2(np.sin(value), np.cos(value))
+
+
+def generate(rng, count):
+    for index in range(count):
+        n = 6
+        truth = [
+            {
+                "id": str(i),
+                "s": i * 1.5 + 1,
+                "angle": rng.uniform(-np.pi, np.pi),
+                "descriptor": [rng.random() for _ in range(4)],
+            }
+            for i in range(n)
+        ]
+        traversals = []
+        for direction in [1, -1, 1]:
+            order = list(range(n)) if direction == 1 else list(range(n - 1, -1, -1))
+            observations = []
+            for i in order:
+                landmark = truth[i]
+                observations.append(
+                    {
+                        "s": landmark["s"] + rng.gauss(0, 0.25),
+                        "angle": landmark["angle"] + rng.gauss(0, 0.1),
+                        "roll": rng.gauss(0, 0.05),
+                        "variance_s": 0.0625,
+                        "variance_angle": 0.01,
+                        "descriptor": (
+                            np.asarray(landmark["descriptor"])
+                            + np.array([rng.gauss(0, 0.1) for _ in range(4)])
+                        ).tolist(),
+                        "truth_id": landmark["id"],
+                    }
+                )
+            traversals.append({"direction": direction, "observations": observations})
+        yield {
+            "id": str(index),
+            "family": f"pipe-{index}",
+            "truth": truth,
+            "traversals": traversals,
+            "order_weight": 2.0,
+            "null_cost": 12.0,
+            "cardinality_weight": 2.0,
+            "top_l": 4,
+            "kappa": 2.0,
+            "map_length_meters": 12.0,
+        }
+
+
+def optimize(observations, landmarks, direction, case, method):
+    n, m = len(observations), len(landmarks)
+    local = np.zeros((n, m + 1))
+    for k, observation in enumerate(observations):
+        for j, landmark in enumerate(landmarks):
+            angle = observation["angle"] + observation["roll"] - landmark["angle"]
+            if method != "no_cyclic_angle":
+                angle = wrap(angle)
+            axial = observation["s"] - landmark["s"]
+            appearance = np.sum(
+                (np.asarray(observation["descriptor"]) - landmark["descriptor"]) ** 2
+            )
+            local[k, j] = (
+                appearance
+                + axial**2 / (observation["variance_s"] + landmark["variance_s"])
+                + (angle**2 / (observation["variance_angle"] + landmark["variance_angle"]))
+            )
+        local[k, -1] = case["null_cost"]
+    active = np.zeros((n, m + 1), dtype=bool)
+    for k in range(n):
+        active[k, np.argsort(local[k, :-1])[: case["top_l"]]] = True
+        active[k, -1] = True
+    penalty = np.zeros((max(n - 1, 0), m, m))
+    for k in range(n - 1):
+        for j in range(m):
+            for other in range(m):
+                epsilon = case["kappa"] * np.sqrt(
+                    landmarks[j]["variance_s"]
+                    + landmarks[other]["variance_s"]
+                    + observations[k]["variance_s"]
+                    + observations[k + 1]["variance_s"]
+                )
+                difference = direction * (landmarks[other]["s"] - landmarks[j]["s"])
+                penalty[k, j, other] = max(0, -difference - epsilon) ** 2
+    if method == "shuffled_order":
+        penalty = penalty[:, ::-1]
+    if method == "hard_order":
+        penalty = (penalty > 0).astype(float) * 1e4
+    weight = 0 if method == "local_only" else case["order_weight"]
+
+    def probability(raw):
+        logits = raw.reshape(n, m + 1)
+        logits = np.where(active, logits, -1e4)
+        exponents = np.exp(logits - logits.max(1, keepdims=True))
+        return exponents / exponents.sum(1, keepdims=True)
+
+    def objective(raw):
+        A = probability(raw)
+        energy = np.sum(A * local)
+        energy += weight * sum(A[k, :-1] @ penalty[k] @ A[k + 1, :-1] for k in range(n - 1))
+        energy += case["cardinality_weight"] * np.maximum(A[:, :-1].sum(0) - 1, 0).dot(
+            np.maximum(A[:, :-1].sum(0) - 1, 0)
+        )
+        energy += 0.1 * np.sum(A * np.log(np.maximum(A, 1e-12)))
+        return float(energy)
+
+    fitted = minimize(objective, -local.ravel(), method="L-BFGS-B", options={"maxiter": 300})
+    if not fitted.success and not np.isfinite(fitted.fun):
+        raise RuntimeError("Association objective failed")
+    A = probability(fitted.x)
+    return A.argmax(1), A
+
+
+def run_case(case, method):
+    traversals = case["traversals"]
+    if not traversals or not traversals[0]["observations"]:
+        raise ValueError("A nonempty anchor traversal is required")
+    landmarks = [
+        {
+            **o,
+            "angle": float(wrap(o["angle"] + o["roll"])),
+            "descriptor": np.asarray(o["descriptor"], dtype=float),
+        }
+        for o in traversals[0]["observations"]
+    ]
+    assignments = [list(range(len(landmarks)))]
+    for traversal in traversals[1:]:
+        ids, A = optimize(
+            traversal["observations"], landmarks, traversal["direction"], case, method
+        )
+        current = []
+        original_count = A.shape[1] - 1
+        for k, (observation, index) in enumerate(zip(traversal["observations"], ids)):
+            if index == original_count:
+                index = len(landmarks)
+                landmarks.append(
+                    {
+                        **observation,
+                        "angle": float(wrap(observation["angle"] + observation["roll"])),
+                        "descriptor": np.asarray(observation["descriptor"]),
+                    }
+                )
+            current.append(int(index))
+        assignments.append(current)
+    return {
+        "landmarks": [{"s": l["s"], "angle": l["angle"]} for l in landmarks],
+        "assignments": assignments,
+    }
+
+
+def score(case, result):
+    landmarks, truth = result["landmarks"], case["truth"]
+    cost = np.array(
+        [
+            [abs(l["s"] - g["s"]) + abs(wrap(l["angle"] - g["angle"])) for g in truth]
+            for l in landmarks
+        ]
+    )
+    left, right = linear_sum_assignment(cost)
+    matched = {int(a): int(b) for a, b in zip(left, right) if cost[a, b] < 2.0}
+    correct = total = crossed = adjacent = 0
+    for traversal, assigned in zip(case["traversals"], result["assignments"]):
+        for observation, identity in zip(traversal["observations"], assigned):
+            correct += (
+                identity in matched and truth[matched[identity]]["id"] == observation["truth_id"]
+            )
+            total += 1
+        for a, b in zip(assigned, assigned[1:]):
+            crossed += traversal["direction"] * (landmarks[b]["s"] - landmarks[a]["s"]) < 0
+            adjacent += 1
+    errors_s = [landmarks[a]["s"] - truth[b]["s"] for a, b in matched.items()]
+    errors_angle = [
+        abs(wrap(landmarks[a]["angle"] - truth[b]["angle"])) for a, b in matched.items()
+    ]
+    return {
+        "unique_count_error": abs(len(landmarks) - len(truth)),
+        "association_f1": correct / total if total else None,
+        "duplicate_landmark_rate": max(0, len(landmarks) - len(matched)) / max(1, len(landmarks)),
+        "missed_landmark_rate": 1 - len(matched) / len(truth),
+        "crossed_identity_rate": crossed / adjacent if adjacent else None,
+        "axial_rmse": float(np.sqrt(np.mean(np.square(errors_s)))) if errors_s else None,
+        "cyclic_angle_mae_radians": float(np.mean(errors_angle)) if errors_angle else None,
+        "map_records_per_km": len(landmarks) / (case["map_length_meters"] / 1000),
+        "legal_effects": correct,
+    }
