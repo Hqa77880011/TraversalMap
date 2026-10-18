@@ -2,7 +2,7 @@ import numpy as np
 from scipy.optimize import linear_sum_assignment, minimize
 
 
-METHODS = ["traversalmap", "local_only", "no_cyclic_angle", "shuffled_order", "hard_order"]
+METHODS = ["traversalmap", "local_only", "no_cyclic_angle", "shuffled_order", "hard_order", "fixed_map"]
 
 
 def wrap(value):
@@ -34,6 +34,7 @@ def generate(rng, count):
                         "roll": rng.gauss(0, 0.05),
                         "variance_s": 0.0625,
                         "variance_angle": 0.01,
+                        "variance_roll": 0.0025,
                         "descriptor": (
                             np.asarray(landmark["descriptor"])
                             + np.array([rng.gauss(0, 0.1) for _ in range(4)])
@@ -53,6 +54,7 @@ def generate(rng, count):
             "top_l": 4,
             "kappa": 2.0,
             "map_length_meters": 12.0,
+            "independent_observations": True,
         }
 
 
@@ -71,7 +73,8 @@ def optimize(observations, landmarks, direction, case, method):
             local[k, j] = (
                 appearance
                 + axial**2 / (observation["variance_s"] + landmark["variance_s"])
-                + (angle**2 / (observation["variance_angle"] + landmark["variance_angle"]))
+                + (angle**2 / (observation["variance_angle"] + observation.get("variance_roll", 0)
+                              + landmark["variance_angle"]))
             )
         local[k, -1] = case["null_cost"]
     active = np.zeros((n, m + 1), dtype=bool)
@@ -119,18 +122,47 @@ def optimize(observations, landmarks, direction, case, method):
     return A.argmax(1), A
 
 
+def make_landmark(observation):
+    """Initialize a landmark from a roll-corrected, non-reference observation."""
+    return dict(s=float(observation["s"]),
+                angle=float(wrap(observation["angle"] + observation["roll"])),
+                variance_s=float(observation["variance_s"]),
+                variance_angle=float(observation["variance_angle"] + observation.get("variance_roll", 0)),
+                descriptor=np.asarray(observation["descriptor"], dtype=float), observations=1)
+
+
+def update_landmark(landmark, observation, independent=False):
+    """Fuse axial/cyclic coordinates; unknown correlation uses intersection."""
+    observed = make_landmark(observation)
+    prior_mean = np.array([landmark["s"], landmark["angle"]])
+    measured = np.array([observed["s"], landmark["angle"] + wrap(observed["angle"] - landmark["angle"])])
+    prior = np.array([landmark["variance_s"], landmark["variance_angle"]])
+    noise = np.array([observed["variance_s"], observed["variance_angle"]])
+    if not np.isfinite(np.r_[prior, noise, measured]).all() or np.any(np.r_[prior, noise] <= 0):
+        raise ValueError("Finite coordinates and positive axial/angle variances required")
+    if independent:
+        variance = 1 / (1 / prior + 1 / noise)
+        mean = variance * (prior_mean / prior + measured / noise)
+    else:
+        # One common CI weight preserves the joint diagonal uncertainty contract.
+        choices = []
+        for weight in np.linspace(0, 1, 101):
+            variance = 1 / (weight / prior + (1 - weight) / noise)
+            mean = variance * (weight * prior_mean / prior + (1 - weight) * measured / noise)
+            choices.append((float(np.log(variance).sum()), mean, variance))
+        _, mean, variance = min(choices, key=lambda option: option[0])
+    count = landmark["observations"]
+    landmark.update(s=float(mean[0]), angle=float(wrap(mean[1])),
+                    variance_s=float(variance[0]), variance_angle=float(variance[1]),
+                    descriptor=(count * landmark["descriptor"] + observed["descriptor"]) / (count + 1),
+                    observations=count + 1)
+
+
 def run_case(case, method):
     traversals = case["traversals"]
     if not traversals or not traversals[0]["observations"]:
         raise ValueError("A nonempty anchor traversal is required")
-    landmarks = [
-        {
-            **o,
-            "angle": float(wrap(o["angle"] + o["roll"])),
-            "descriptor": np.asarray(o["descriptor"], dtype=float),
-        }
-        for o in traversals[0]["observations"]
-    ]
+    landmarks = [make_landmark(o) for o in traversals[0]["observations"]]
     assignments = [list(range(len(landmarks)))]
     for traversal in traversals[1:]:
         ids, A = optimize(
@@ -141,17 +173,14 @@ def run_case(case, method):
         for k, (observation, index) in enumerate(zip(traversal["observations"], ids)):
             if index == original_count:
                 index = len(landmarks)
-                landmarks.append(
-                    {
-                        **observation,
-                        "angle": float(wrap(observation["angle"] + observation["roll"])),
-                        "descriptor": np.asarray(observation["descriptor"]),
-                    }
-                )
+                landmarks.append(make_landmark(observation))
+            elif method != "fixed_map":
+                update_landmark(landmarks[index], observation, case.get("independent_observations", False))
             current.append(int(index))
         assignments.append(current)
     return {
-        "landmarks": [{"s": l["s"], "angle": l["angle"]} for l in landmarks],
+        "landmarks": [{key: l[key] for key in ("s", "angle", "variance_s", "variance_angle", "observations")}
+                      for l in landmarks],
         "assignments": assignments,
     }
 

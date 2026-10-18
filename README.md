@@ -37,7 +37,7 @@ python -m traversalmap run --data data/workload.jsonl --output runs/main
 python -m traversalmap suite --data data/workload.jsonl --output runs/comparison
 ```
 
-Select methods with `--methods`. traversalmap, local_only, no_cyclic_angle, shuffled_order and hard_order.
+Select methods with `--methods`. traversalmap, local_only, no_cyclic_angle, shuffled_order, hard_order and fixed_map.
 
 ## Evaluation and visualization
 
@@ -53,7 +53,7 @@ Pass multiple method directories to compare them. Plotting writes `summary.csv` 
 
 ## Implementation conventions
 
-The fixed frontend provides pose/roll posteriors. The numerical optimizer solves soft association over top-L candidate landmarks; null assignments create new records. This isolates the order factor with matched detections and poses. New pipe segments must be initialized at branches or geometry discontinuities, where the traversal invariant is suspended.
+The fixed frontend provides pose/roll posteriors. The numerical optimizer solves soft association over top-L candidate landmarks; null assignments create new records. Matched observations now update landmark axial/cyclic means, variances and descriptor averages. Corrected angle variance includes optional `variance_roll`. Set `independent_observations: true` only for independent measurement errors: the finite generator declares this convention. Unknown/shared pose correlation uses a common covariance-intersection weight rather than halving uncertainty. Angle fusion unwraps around the prior and wraps the result, preserving the clock-angle boundary. `fixed_map` disables fusion while retaining the same association/order factors. New segments must be initialized at branches or geometry discontinuities.
 
 
 ## Uncertainty and paired comparisons
@@ -63,3 +63,15 @@ python -m traversalmap.statistics --records runs/main/traversalmap/records.jsonl
 ```
 
 Supply --reference with a matched record file for paired differences. Resampling uses independent case IDs, or explicit cluster IDs when provided. Repeated observations from one source unit must share cluster. Zero-event bounds refer to an event in an independent cluster.
+
+## Fixed reproduction setting
+
+Six-defect straight-segment map, three forward/reverse traversals, top-L=4; independent coordinate fusion, cyclic angles and fixed-map ablation.
+
+The checked-in entry point fixes data seeds, methods, budgets and output paths. Inspect its commands without starting any computation:
+
+```bash
+python reproduce.py --plan
+```
+
+Remove `--plan` to execute the registered pipeline in a fresh output directory. The entry point calls the existing implementation; it does not insert paper results. Installation uses the package instructions above.
