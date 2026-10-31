@@ -3,12 +3,13 @@ import time
 from scipy.optimize import linear_sum_assignment, minimize
 
 from .joint import optimize_joint
-from .maintenance import build_records, score_maintenance
+from .maintenance import build_records, score_maintenance, distribution
 
 
 METHODS = ["traversalmap", "local_only", "no_cyclic_angle", "shuffled_order", "hard_order", "fixed_map",
            "fixed_order_tolerance", "no_soft_hypotheses", "appearance_only", "position_only",
-           "generic_smoothness", "no_joint_optimization"]
+           "generic_smoothness", "no_joint_optimization", "no_alternation", "no_class_likelihood",
+           "jcbb", "probabilistic_semantic", "kslam"]
 
 
 def wrap(value):
@@ -75,6 +76,9 @@ def generate(rng, count):
 
 
 def optimize(observations, landmarks, direction, case, method):
+    if method in ("jcbb", "probabilistic_semantic"):
+        from .association import associate
+        return associate(observations, landmarks, case, method)
     n, m = len(observations), len(landmarks)
     local = np.zeros((n, m + 1))
     for k, observation in enumerate(observations):
@@ -86,12 +90,26 @@ def optimize(observations, landmarks, direction, case, method):
             appearance = np.sum(
                 (np.asarray(observation["descriptor"]) - landmark["descriptor"]) ** 2
             )
+            class_cost = 0.0
+            if method not in ("no_class_likelihood", "appearance_only", "position_only") and "class_probabilities" in observation and "class_probabilities" in landmark:
+                classes = list(range(len(observation["class_probabilities"])))
+                observed = distribution(observation["class_probabilities"], classes)
+                predicted = distribution(landmark["class_probabilities"], classes)
+                class_cost = -case.get("class_weight", 1.0) * np.log(max(float(observed @ predicted), 1e-12))
+            geometric_cost = (axial**2 / (observation["variance_s"] + landmark["variance_s"])
+                              + angle**2 / (observation["variance_angle"] + observation.get("variance_roll", 0)
+                                           + landmark["variance_angle"]))
+            if "_state_covariance" in case:
+                from .association import innovation
+                error, covariance = innovation(observations, landmarks, case, [(k, j)])
+                if method == "no_cyclic_angle":
+                    error[1] = angle
+                geometric_cost = float(error @ np.linalg.solve(covariance, error))
             local[k, j] = (
                 (0 if method == "position_only" else appearance)
+                + class_cost
                 + (0 if method == "appearance_only" else
-                   axial**2 / (observation["variance_s"] + landmark["variance_s"])
-                   + angle**2 / (observation["variance_angle"] + observation.get("variance_roll", 0)
-                                + landmark["variance_angle"]))
+                   geometric_cost)
             )
         local[k, -1] = case["null_cost"]
     active = np.zeros((n, m + 1), dtype=bool)
@@ -163,11 +181,15 @@ def optimize(observations, landmarks, direction, case, method):
 
 def make_landmark(observation):
     """Initialize a landmark from a roll-corrected, non-reference observation."""
-    return dict(s=float(observation["s"]),
+    landmark = dict(s=float(observation["s"]),
                 angle=float(wrap(observation["angle"] + observation["roll"])),
                 variance_s=float(observation["variance_s"]),
                 variance_angle=float(observation["variance_angle"] + observation.get("variance_roll", 0)),
                 descriptor=np.asarray(observation["descriptor"], dtype=float), observations=1)
+    if "class_probabilities" in observation:
+        landmark["class_probabilities"] = distribution(observation["class_probabilities"],
+                                                      list(range(len(observation["class_probabilities"]))))
+    return landmark
 
 
 def update_landmark(landmark, observation, independent=False):
@@ -191,6 +213,8 @@ def update_landmark(landmark, observation, independent=False):
             choices.append((float(np.log(variance).sum()), mean, variance))
         _, mean, variance = min(choices, key=lambda option: option[0])
     count = landmark["observations"]
+    if "class_probabilities" in observed and "class_probabilities" in landmark:
+        landmark["class_probabilities"] = (count*landmark["class_probabilities"] + observed["class_probabilities"]) / (count+1)
     landmark.update(s=float(mean[0]), angle=float(wrap(mean[1])),
                     variance_s=float(variance[0]), variance_angle=float(variance[1]),
                     descriptor=(count * landmark["descriptor"] + observed["descriptor"]) / (count + 1),
@@ -201,6 +225,9 @@ def run_case(case, method, profile=False):
     """Associate traversals, solve the joint state block and build audit records."""
     if method not in METHODS:
         raise ValueError("Unknown traversal mapping method")
+    if method == "kslam":
+        from .kslam import run
+        return run(case, profile)
     traversals = case["traversals"]
     if not traversals or not traversals[0]["observations"]:
         raise ValueError("A nonempty anchor traversal is required")
@@ -235,7 +262,66 @@ def run_case(case, method, profile=False):
     joint_seconds = 0.0
     if joint_enabled:
         start = time.perf_counter()
-        poses, joint_report = optimize_joint(case, landmarks, posterior, method)
+        poses, joint_report, state_covariance = optimize_joint(case, landmarks, posterior, method, return_covariance=True)
+        reports = [dict(joint_report)]
+        rounds = case.get("alternating_iterations", 3) if method != "no_alternation" else 1
+        if rounds < 1:
+            raise ValueError("alternating_iterations must be positive")
+        for iteration in range(1, rounds):
+            pose_lookup = {(pose["traversal"], pose["frame_id"]): (i, pose) for i, pose in enumerate(poses)}
+            previous = np.asarray([row for traversal in posterior for row in traversal])
+            updated, new_assignments, nulls = [], [], []
+            for r, traversal in enumerate(traversals):
+                corrected, pose_indices = [], []
+                for k, observation in enumerate(traversal["observations"]):
+                    pose_index, pose = pose_lookup[r, str(observation.get("frame_id", k))]
+                    prior_s = observation.get("pose_s", observation["s"]-observation.get("axial_offset", 0))
+                    offset = observation.get("axial_offset", observation["s"]-prior_s)
+                    corrected.append(dict(observation, s=pose["s"]+offset, roll=pose["roll"]))
+                    pose_indices.append(pose_index)
+                association_case = dict(case, _state_covariance=state_covariance,
+                                        _pose_indices=pose_indices, _pose_dimensions=2*len(poses))
+                ids, probabilities = optimize(corrected, landmarks, traversal["direction"], association_case, method)
+                # Births are resolved into persistent variables before the next state solve.
+                width = probabilities.shape[1]-1
+                rows = []
+                for k, index in enumerate(ids):
+                    weights = probabilities[k, :-1].tolist()
+                    if index == width:
+                        index = len(landmarks)
+                        landmarks.append(make_landmark(corrected[k]))
+                        weights += [0.0]*(index-len(weights)) + [float(probabilities[k, -1])]
+                    new_assignments.append((r, k, int(index)))
+                    rows.append(weights)
+                updated.append(rows)
+                nulls.append(probabilities[:, -1].tolist())
+            posterior = [[row+[0.0]*(len(landmarks)-len(row)) for row in traversal] for traversal in updated]
+            assignments = [[index for rr, _, index in new_assignments if rr == r] for r in range(len(traversals))]
+            null_probabilities = nulls
+            # Recompute appearance/class prototypes once from current raw evidence and A.
+            for j, landmark in enumerate(landmarks):
+                descriptors, class_vectors, weights, class_weights = [], [], [], []
+                for r, traversal in enumerate(traversals):
+                    for k, observation in enumerate(traversal["observations"]):
+                        weight = posterior[r][k][j] * observation.get("quality", 1.0)
+                        if weight > 0:
+                            descriptors.append(np.asarray(observation["descriptor"])); weights.append(weight)
+                            if "class_probabilities" in observation:
+                                vector = observation["class_probabilities"]
+                                class_vectors.append(distribution(vector, list(range(len(vector))))); class_weights.append(weight)
+                if weights:
+                    landmark["descriptor"] = np.average(descriptors, axis=0, weights=weights)
+                if class_weights:
+                    landmark["class_probabilities"] = np.average(class_vectors, axis=0, weights=class_weights)
+            poses, joint_report, state_covariance = optimize_joint(case, landmarks, posterior, method,
+                                                                  initial_poses=poses, return_covariance=True)
+            current = np.asarray([row for traversal in posterior for row in traversal])
+            delta = float(np.max(np.abs(current-previous))) if current.shape == previous.shape else None
+            reports.append(dict(joint_report, posterior_change=delta))
+            if delta is not None and delta < case.get("alternating_tolerance", 1e-4):
+                break
+        joint_report["alternating_rounds"] = len(reports)
+        joint_report["rounds"] = reports
         joint_seconds = time.perf_counter() - start
     result = {
         "landmarks": [{key: l[key] for key in ("s", "angle", "variance_s", "variance_angle", "observations")}
@@ -252,6 +338,9 @@ def run_case(case, method, profile=False):
         result["poses"] = poses
     if profile:
         result["joint_optimization_seconds"] = joint_seconds
+    if case.get("enable_loop_audit", False):
+        from .loops import apply
+        result = apply(case, result, landmarks, method)
     result["maintenance_records"] = build_records(case, result)
     result["worklist"] = [record for record in result["maintenance_records"] if record["requires_action"]]
     result["review_list"] = [record["id"] for record in result["maintenance_records"] if record["review_flag"]]
@@ -316,6 +405,9 @@ def score(case, result):
         "legal_effects": correct,
     }
     report.update(score_maintenance(case, result, matched))
+    if "loop_audit" in result:
+        from .loops import metrics
+        report.update(metrics(case, result))
     joint = result.get("joint_optimization", {})
     for key in ("initial_cost", "final_cost", "initial_gradient_norm", "pose_change_l2", "landmark_change_l2"):
         report["joint_" + key] = joint.get(key)

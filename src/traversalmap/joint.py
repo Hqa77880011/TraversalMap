@@ -85,7 +85,7 @@ class PoseLandmarkProblem:
             if method == "shuffled_order":
                 order = np.random.default_rng(case.get("order_seed", 17)).permutation(len(order))
             weight = case.get("order_weight", 0)
-            if method in ("local_only", "appearance_only", "position_only", "no_soft_hypotheses"):
+            if method in ("local_only", "appearance_only", "position_only", "no_soft_hypotheses", "jcbb", "probabilistic_semantic", "kslam"):
                 weight = 0
             for first, second in zip(order[:-1], order[1:]):
                 a, b = traversal["observations"][first], traversal["observations"][second]
@@ -100,6 +100,11 @@ class PoseLandmarkProblem:
                             epsilon = case.get("fixed_order_tolerance_m", .5)
                         factor = np.sqrt(weight * posteriors[r][first][j] * posteriors[r][second][other])
                         self.orders.append((j, other, traversal["direction"], epsilon, factor, method))
+        for edge in case.get("_loop_edges", []):
+            first = frame_maps[edge["from_traversal"]][str(edge["from_frame"])]
+            second = frame_maps[edge["to_traversal"]][str(edge["to_frame"])]
+            self.odometry.append((first, second, np.array([edge["delta_s"], edge["delta_roll"]]),
+                                  whitener(edge["covariance"])))
 
     def linearize(self, values):
         """Return whitened residuals and their analytic Jacobian at state values."""
@@ -148,9 +153,14 @@ class PoseLandmarkProblem:
         return np.concatenate(residuals), np.vstack(jacobians)
 
 
-def optimize_joint(case, landmarks, posteriors, method):
+def optimize_joint(case, landmarks, posteriors, method, initial_poses=None, return_covariance=False):
     """Optimize both state blocks and return conditional Gaussian marginals."""
     problem = PoseLandmarkProblem(case, landmarks, posteriors, method)
+    if initial_poses is not None:
+        lookup = {(pose["traversal"], pose["frame_id"]): pose for pose in initial_poses}
+        for i, frame in enumerate(problem.frames):
+            pose = lookup[frame["traversal"], frame["frame_id"]]
+            problem.initial[2*i:2*i+2] = [pose["s"], pose["roll"]]
     initial_residual, initial_jacobian = problem.linearize(problem.initial)
     fitted = least_squares(lambda value: problem.linearize(value)[0], problem.initial,
                            jac=lambda value: problem.linearize(value)[1],
@@ -166,6 +176,7 @@ def optimize_joint(case, landmarks, posteriors, method):
         if conservative:
             prior = np.diag(problem.pose_covariance)[2 * i:2 * i + 2]
             block += np.diag(np.maximum(prior - np.diag(block), 0))
+            covariance[2*i:2*i+2, 2*i:2*i+2] = block
         poses.append(dict(traversal=frame["traversal"], frame_id=frame["frame_id"],
                           s=float(fitted.x[2 * i]), roll=float(wrap(fitted.x[2 * i + 1])),
                           covariance=block.tolist()))
@@ -175,6 +186,7 @@ def optimize_joint(case, landmarks, posteriors, method):
         if conservative:
             floor = [landmark["variance_s"], landmark["variance_angle"]]
             block += np.diag(np.maximum(np.asarray(floor) - np.diag(block), 0))
+            covariance[offset:offset+2, offset:offset+2] = block
         landmark.update(s=float(fitted.x[offset]), angle=float(wrap(fitted.x[offset + 1])),
                         variance_s=float(block[0, 0]), variance_angle=float(block[1, 1]),
                         covariance=block.tolist())
@@ -187,4 +199,6 @@ def optimize_joint(case, landmarks, posteriors, method):
                   pose_prior_residuals=problem.pose_dimensions, odometry_factors=len(problem.odometry),
                   observation_factors=len(problem.factors), order_factors=len(problem.orders),
                   unknown_correlation_marginal_floor=conservative)
+    if return_covariance:
+        return poses, report, covariance
     return poses, report
