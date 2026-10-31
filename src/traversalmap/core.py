@@ -2,7 +2,9 @@ import numpy as np
 from scipy.optimize import linear_sum_assignment, minimize
 
 
-METHODS = ["traversalmap", "local_only", "no_cyclic_angle", "shuffled_order", "hard_order", "fixed_map"]
+METHODS = ["traversalmap", "local_only", "no_cyclic_angle", "shuffled_order", "hard_order", "fixed_map",
+           "fixed_order_tolerance", "no_soft_hypotheses", "appearance_only", "position_only",
+           "generic_smoothness"]
 
 
 def wrap(value):
@@ -71,33 +73,45 @@ def optimize(observations, landmarks, direction, case, method):
                 (np.asarray(observation["descriptor"]) - landmark["descriptor"]) ** 2
             )
             local[k, j] = (
-                appearance
-                + axial**2 / (observation["variance_s"] + landmark["variance_s"])
-                + (angle**2 / (observation["variance_angle"] + observation.get("variance_roll", 0)
-                              + landmark["variance_angle"]))
+                (0 if method == "position_only" else appearance)
+                + (0 if method == "appearance_only" else
+                   axial**2 / (observation["variance_s"] + landmark["variance_s"])
+                   + angle**2 / (observation["variance_angle"] + observation.get("variance_roll", 0)
+                                + landmark["variance_angle"]))
             )
         local[k, -1] = case["null_cost"]
     active = np.zeros((n, m + 1), dtype=bool)
     for k in range(n):
         active[k, np.argsort(local[k, :-1])[: case["top_l"]]] = True
+        if method != "appearance_only":
+            gate = case.get("axial_gate_sigma", 5.0)
+            for j, landmark in enumerate(landmarks):
+                active[k, j] &= abs(observations[k]["s"] - landmark["s"]) <= gate * np.sqrt(
+                    observations[k]["variance_s"] + landmark["variance_s"])
         active[k, -1] = True
+    order = np.arange(n)
+    if method == "shuffled_order":
+        order = np.random.default_rng(case.get("order_seed", 17)).permutation(n)
+    pairs = list(zip(order[:-1], order[1:]))
     penalty = np.zeros((max(n - 1, 0), m, m))
-    for k in range(n - 1):
+    for k, (first, second) in enumerate(pairs):
         for j in range(m):
             for other in range(m):
                 epsilon = case["kappa"] * np.sqrt(
                     landmarks[j]["variance_s"]
                     + landmarks[other]["variance_s"]
-                    + observations[k]["variance_s"]
-                    + observations[k + 1]["variance_s"]
+                    + case.get("delta_s_variance", observations[first]["variance_s"]
+                               + observations[second]["variance_s"])
                 )
+                if method == "fixed_order_tolerance":
+                    epsilon = case.get("fixed_order_tolerance_m", 0.5)
                 difference = direction * (landmarks[other]["s"] - landmarks[j]["s"])
                 penalty[k, j, other] = max(0, -difference - epsilon) ** 2
-    if method == "shuffled_order":
-        penalty = penalty[:, ::-1]
+                if method == "generic_smoothness":
+                    penalty[k, j, other] = (landmarks[other]["s"] - landmarks[j]["s"]) ** 2
     if method == "hard_order":
         penalty = (penalty > 0).astype(float) * 1e4
-    weight = 0 if method == "local_only" else case["order_weight"]
+    weight = 0 if method in ("local_only", "appearance_only", "position_only", "no_soft_hypotheses") else case["order_weight"]
 
     def probability(raw):
         logits = raw.reshape(n, m + 1)
@@ -108,14 +122,25 @@ def optimize(observations, landmarks, direction, case, method):
     def objective(raw):
         A = probability(raw)
         energy = np.sum(A * local)
-        energy += weight * sum(A[k, :-1] @ penalty[k] @ A[k + 1, :-1] for k in range(n - 1))
-        energy += case["cardinality_weight"] * np.maximum(A[:, :-1].sum(0) - 1, 0).dot(
-            np.maximum(A[:, :-1].sum(0) - 1, 0)
-        )
+        gradient = local.copy()
+        for k, (first, second) in enumerate(pairs):
+            energy += weight * (A[first, :-1] @ penalty[k] @ A[second, :-1])
+            gradient[first, :-1] += weight * (penalty[k] @ A[second, :-1])
+            gradient[second, :-1] += weight * (penalty[k].T @ A[first, :-1])
+        excess = np.maximum(A[:, :-1].sum(0) - 1, 0)
+        energy += case["cardinality_weight"] * excess.dot(excess)
+        gradient[:, :-1] += 2 * case["cardinality_weight"] * excess[None]
         energy += 0.1 * np.sum(A * np.log(np.maximum(A, 1e-12)))
-        return float(energy)
+        gradient += 0.1 * (np.log(np.maximum(A, 1e-12)) + 1)
+        gradient = A * (gradient - (A * gradient).sum(1, keepdims=True))
+        gradient[~active] = 0
+        return float(energy), gradient.ravel()
 
-    fitted = minimize(objective, -local.ravel(), method="L-BFGS-B", options={"maxiter": 300})
+    if method == "no_soft_hypotheses":
+        ids = np.where(active, local, np.inf).argmin(1)
+        return ids, np.eye(m + 1)[ids]
+    fitted = minimize(objective, -np.minimum(local, 10).ravel(), method="L-BFGS-B",
+                      jac=True, bounds=[(-30, 30)] * local.size, options={"maxiter": 300})
     if not fitted.success and not np.isfinite(fitted.fun):
         raise RuntimeError("Association objective failed")
     A = probability(fitted.x)
@@ -194,7 +219,8 @@ def score(case, result):
         ]
     )
     left, right = linear_sum_assignment(cost)
-    matched = {int(a): int(b) for a, b in zip(left, right) if cost[a, b] < 2.0}
+    matched = {int(a): int(b) for a, b in zip(left, right)
+               if cost[a, b] < case.get("evaluation_matching_gate", 2.0)}
     correct = total = crossed = adjacent = 0
     for traversal, assigned in zip(case["traversals"], result["assignments"]):
         for observation, identity in zip(traversal["observations"], assigned):
@@ -209,9 +235,30 @@ def score(case, result):
     errors_angle = [
         abs(wrap(landmarks[a]["angle"] - truth[b]["angle"])) for a, b in matched.items()
     ]
+    predicted_ids = [identity for assigned in result["assignments"] for identity in assigned]
+    truth_ids = [observation["truth_id"] for traversal in case["traversals"]
+                 for observation in traversal["observations"]]
+    # Pairwise identity F1 penalizes both merged and split physical landmarks.
+    contingency = {}
+    predicted_counts, truth_counts = {}, {}
+    for prediction, reference in zip(predicted_ids, truth_ids):
+        contingency[prediction, reference] = contingency.get((prediction, reference), 0) + 1
+        predicted_counts[prediction] = predicted_counts.get(prediction, 0) + 1
+        truth_counts[reference] = truth_counts.get(reference, 0) + 1
+    pairs_count = lambda counts: sum(count * (count - 1) // 2 for count in counts)
+    true_positive = pairs_count(contingency.values())
+    predicted_pairs, true_pairs = pairs_count(predicted_counts.values()), pairs_count(truth_counts.values())
+    precision = true_positive / predicted_pairs if predicted_pairs else float(true_pairs == 0)
+    recall = true_positive / true_pairs if true_pairs else float(predicted_pairs == 0)
     return {
         "unique_count_error": abs(len(landmarks) - len(truth)),
-        "association_f1": correct / total if total else None,
+        "association_f1": 2 * precision * recall / (precision + recall) if precision + recall else 0.0,
+        "association_precision": precision,
+        "association_recall": recall,
+        "observation_identity_accuracy": correct / total if total else None,
+        "association_true_positive_pairs": true_positive,
+        "association_predicted_pairs": predicted_pairs,
+        "association_reference_pairs": true_pairs,
         "duplicate_landmark_rate": max(0, len(landmarks) - len(matched)) / max(1, len(landmarks)),
         "missed_landmark_rate": 1 - len(matched) / len(truth),
         "crossed_identity_rate": crossed / adjacent if adjacent else None,
