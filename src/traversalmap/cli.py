@@ -13,6 +13,7 @@ import numpy as np
 import psutil
 
 from . import core
+from .maintenance import export_records
 
 
 def read_jsonl(path):
@@ -59,7 +60,7 @@ def summarize(rows):
         }
     elapsed = sum(row["metrics"]["latency_ms"] for row in rows) / 1000
     legal = sum(row["metrics"].get("legal_effects", 0) for row in rows)
-    report["legal_throughput_per_second"] = legal / elapsed if elapsed else None
+    report["legal_throughput_per_second"] = legal / elapsed if elapsed and any("legal_effects" in row["metrics"] for row in rows) else None
     return report
 
 
@@ -69,11 +70,16 @@ def execute(cases, method, output):
     for case in cases:
         start_cpu = time.process_time()
         start = time.perf_counter()
-        result = core.run_case(case, method)
+        result = core.run_case(case, method, profile=True)
         elapsed = time.perf_counter() - start
         cpu = time.process_time() - start_cpu
-        metrics = core.score(case, result)
+        if case.get("truth"):
+            metrics = core.score(case, result)
+        else:
+            metrics = dict(landmark_count=len(result["landmarks"]),
+                           map_records_per_km=len(result["landmarks"]) / (case["map_length_meters"] / 1000))
         metrics.update(
+            batch_optimization_seconds=result.get("joint_optimization_seconds", 0.0),
             latency_ms=elapsed * 1000,
             cpu_seconds=cpu,
             rss_mib=process.memory_info().rss / 2**20,
@@ -95,6 +101,7 @@ def execute(cases, method, output):
     (output / "metrics.json").write_text(
         json.dumps(summarize(rows), indent=2, allow_nan=False), encoding="utf-8"
     )
+    export_records(rows, output / "maintenance")
     return rows
 
 
@@ -162,6 +169,9 @@ def main():
     item = sub.add_parser("plot")
     item.add_argument("--inputs", nargs="+", required=True)
     item.add_argument("--output", required=True)
+    item = sub.add_parser("export")
+    item.add_argument("--records", required=True)
+    item.add_argument("--output", required=True)
     args = parser.parse_args()
     if args.command == "prepare":
         if args.count < 1:
@@ -174,6 +184,8 @@ def main():
         cases = read_jsonl(args.data)
         for method in args.methods:
             execute(cases, method, Path(args.output) / method)
+    elif args.command == "export":
+        export_records(read_jsonl(args.records), args.output)
     else:
         plot(args.inputs, args.output)
 

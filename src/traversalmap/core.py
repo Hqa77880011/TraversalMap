@@ -1,10 +1,14 @@
 import numpy as np
+import time
 from scipy.optimize import linear_sum_assignment, minimize
+
+from .joint import optimize_joint
+from .maintenance import build_records, score_maintenance
 
 
 METHODS = ["traversalmap", "local_only", "no_cyclic_angle", "shuffled_order", "hard_order", "fixed_map",
            "fixed_order_tolerance", "no_soft_hypotheses", "appearance_only", "position_only",
-           "generic_smoothness"]
+           "generic_smoothness", "no_joint_optimization"]
 
 
 def wrap(value):
@@ -20,14 +24,16 @@ def generate(rng, count):
                 "s": i * 1.5 + 1,
                 "angle": rng.uniform(-np.pi, np.pi),
                 "descriptor": [rng.random() for _ in range(4)],
+                "class": "crack" if i % 2 == 0 else "deposit",
+                "severity": i % 3 + 1,
             }
             for i in range(n)
         ]
         traversals = []
-        for direction in [1, -1, 1]:
+        for r, direction in enumerate([1, -1, 1]):
             order = list(range(n)) if direction == 1 else list(range(n - 1, -1, -1))
             observations = []
-            for i in order:
+            for k, i in enumerate(order):
                 landmark = truth[i]
                 observations.append(
                     {
@@ -42,6 +48,11 @@ def generate(rng, count):
                             + np.array([rng.gauss(0, 0.1) for _ in range(4)])
                         ).tolist(),
                         "truth_id": landmark["id"],
+                        "frame_id": str(k),
+                        "source_frame": f"traversal-{r}/frame-{k:04d}",
+                        "class_probabilities": [.9, .1] if landmark["class"] == "crack" else [.1, .9],
+                        "severity_probabilities": [.9 if level == landmark["severity"] else .1 / 3 for level in range(4)],
+                        "quality": .9,
                     }
                 )
             traversals.append({"direction": direction, "observations": observations})
@@ -57,6 +68,9 @@ def generate(rng, count):
             "kappa": 2.0,
             "map_length_meters": 12.0,
             "independent_observations": True,
+            "class_labels": ["crack", "deposit"],
+            "severity_levels": [0, 1, 2, 3],
+            "maintenance": {"actionable_classes": ["crack"], "minimum_severity": 2},
         }
 
 
@@ -183,31 +197,65 @@ def update_landmark(landmark, observation, independent=False):
                     observations=count + 1)
 
 
-def run_case(case, method):
+def run_case(case, method, profile=False):
+    """Associate traversals, solve the joint state block and build audit records."""
+    if method not in METHODS:
+        raise ValueError("Unknown traversal mapping method")
     traversals = case["traversals"]
     if not traversals or not traversals[0]["observations"]:
         raise ValueError("A nonempty anchor traversal is required")
     landmarks = [make_landmark(o) for o in traversals[0]["observations"]]
     assignments = [list(range(len(landmarks)))]
+    soft = [[{j: 1.0} for j in range(len(landmarks))]]
+    null_probabilities = [[0.0] * len(landmarks)]
     for traversal in traversals[1:]:
         ids, A = optimize(
             traversal["observations"], landmarks, traversal["direction"], case, method
         )
         current = []
+        current_soft = []
         original_count = A.shape[1] - 1
         for k, (observation, index) in enumerate(zip(traversal["observations"], ids)):
+            weights = {j: float(probability) for j, probability in enumerate(A[k, :-1]) if probability > 0}
             if index == original_count:
                 index = len(landmarks)
                 landmarks.append(make_landmark(observation))
+                weights[index] = float(A[k, -1])
             elif method != "fixed_map":
                 update_landmark(landmarks[index], observation, case.get("independent_observations", False))
             current.append(int(index))
+            current_soft.append(weights)
         assignments.append(current)
-    return {
+        soft.append(current_soft)
+        null_probabilities.append(A[:, -1].tolist())
+    posterior = [[[weights.get(j, 0.0) for j in range(len(landmarks))] for weights in traversal] for traversal in soft]
+    joint_enabled = case.get("joint_optimization", True) and method not in ("fixed_map", "no_joint_optimization")
+    poses = None
+    joint_report = dict(enabled=False)
+    joint_seconds = 0.0
+    if joint_enabled:
+        start = time.perf_counter()
+        poses, joint_report = optimize_joint(case, landmarks, posterior, method)
+        joint_seconds = time.perf_counter() - start
+    result = {
         "landmarks": [{key: l[key] for key in ("s", "angle", "variance_s", "variance_angle", "observations")}
                       for l in landmarks],
         "assignments": assignments,
+        "association_posteriors": posterior,
+        "new_landmark_hypothesis_probabilities": null_probabilities,
+        "joint_optimization": joint_report,
     }
+    for saved, landmark in zip(result["landmarks"], landmarks):
+        if "covariance" in landmark:
+            saved["covariance"] = landmark["covariance"]
+    if poses is not None:
+        result["poses"] = poses
+    if profile:
+        result["joint_optimization_seconds"] = joint_seconds
+    result["maintenance_records"] = build_records(case, result)
+    result["worklist"] = [record for record in result["maintenance_records"] if record["requires_action"]]
+    result["review_list"] = [record["id"] for record in result["maintenance_records"] if record["review_flag"]]
+    return result
 
 
 def score(case, result):
@@ -250,7 +298,7 @@ def score(case, result):
     predicted_pairs, true_pairs = pairs_count(predicted_counts.values()), pairs_count(truth_counts.values())
     precision = true_positive / predicted_pairs if predicted_pairs else float(true_pairs == 0)
     recall = true_positive / true_pairs if true_pairs else float(predicted_pairs == 0)
-    return {
+    report = {
         "unique_count_error": abs(len(landmarks) - len(truth)),
         "association_f1": 2 * precision * recall / (precision + recall) if precision + recall else 0.0,
         "association_precision": precision,
@@ -267,3 +315,8 @@ def score(case, result):
         "map_records_per_km": len(landmarks) / (case["map_length_meters"] / 1000),
         "legal_effects": correct,
     }
+    report.update(score_maintenance(case, result, matched))
+    joint = result.get("joint_optimization", {})
+    for key in ("initial_cost", "final_cost", "initial_gradient_norm", "pose_change_l2", "landmark_change_l2"):
+        report["joint_" + key] = joint.get(key)
+    return report
