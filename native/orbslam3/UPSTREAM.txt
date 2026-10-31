@@ -1,0 +1,19 @@
+ORB-SLAM3 official upstream: https://github.com/UZ-SLAMLab/ORB_SLAM3
+Pinned commit: 4452a3c4ab75b1cde34e5505a36ec3f9edcdc4c4
+License: GPL-3.0-or-later; complete original LICENSE retained in this directory.
+Original Thirdparty/DBoW2, Thirdparty/g2o and Thirdparty/Sophus source/license files
+remain in the separately fetched upstream checkout and native source cache.
+
+The build helper copies original System/Tracking/LocalMapping/LoopClosing,
+ORB feature/matcher, map/atlas, optimizer and bundled DBoW2/g2o sources.
+Display-only changes: no Pangolin include, GLubyte -> same unsigned char type,
+MapDrawer camera display setter and Viewer disabled (viewer construction fails).
+The runner always passes bUseViewer=false. Native SLAM algorithms are unchanged.
+System shutdown joins its original local-mapping and loop-closing worker threads.
+OpenCV umbrella headers are narrowed to actual required modules; g2o uses a
+static sequential numerical config. C++14/O0 are functional build choices, not timing
+settings from the paper. Native mapping/loop threads remain original, but the
+runner is pinned to one allowed CPU and OpenCV/Eigen/BLAS parallelism is off.
+Temporary assembly/objects/linking use a Linux-native task cache to avoid 9P
+random-write delays; completed objects, dependency files and executable are copied
+to the repository's declared output directory. No global package installation.
