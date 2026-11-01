@@ -1,10 +1,8 @@
 """K-SLAM Algorithms 1/2 (Zhang et al., ICRA 2023), cylindrical-pose instance.
 
-The original Euclidean 3-D measurement objective is retained. Robot poses are
-restricted to the paper's known pipe axis (axial translation and camera roll).
-This is a native mathematical reimplementation, not the authors' source code.
-https://arxiv.org/html/2302.13264v3
-"""
+The Euclidean 3-D measurement objective uses poses restricted to axial
+translation and camera roll around the known pipe axis.
+https://arxiv.org/html/2302.13264v3"""
 
 import time
 

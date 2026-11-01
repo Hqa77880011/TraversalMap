@@ -1,8 +1,6 @@
-"""Run the genuine compiled ORB-SLAM3 on pixels, then export calibrated pipe poses.
+"""Run compiled ORB-SLAM3 on pixels and export calibrated pipe poses.
 
-This module orchestrates an external GPL-3 native executable; it does not replace
-visual SLAM with pose-file input or an approximate Python estimator.
-"""
+This module orchestrates an external GPL-3 native executable."""
 
 import argparse
 import copy
